@@ -6,9 +6,9 @@ import json
 import requests
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
-# ===== ИСТОЧНИКИ ПОДПИСОК =====
+# ===== ИСТОЧНИКИ =====
 SOURCES = [
     "https://raw.githubusercontent.com/whoahaow/rjsxrd/main/githubmirror/bypass/bypass-1.txt",
     "https://raw.githubusercontent.com/whoahaow/rjsxrd/main/githubmirror/bypass/bypass-2.txt",
@@ -19,25 +19,23 @@ SOURCES = [
     "https://raw.githubusercontent.com/whoahaow/rjsxrd/main/githubmirror/bypass/bypass-7.txt",
     "https://raw.githubusercontent.com/whoahaow/rjsxrd/main/githubmirror/bypass/bypass-8.txt",
     "https://raw.githubusercontent.com/whoahaow/rjsxrd/main/githubmirror/bypass/bypass-9.txt",
-    "https://raw.githubusercontent.com/whoahaow/rjsxrd/main/githubmirror/bypass/bypass-10.txt",
-    "https://raw.githubusercontent.com/whoahaow/rjsxrd/main/githubmirror/bypass/bypass-11.txt",
-    "https://raw.githubusercontent.com/whoahaow/rjsxrd/main/githubmirror/bypass/bypass-12.txt",
-    "https://raw.githubusercontent.com/whoahaow/rjsxrd/main/githubmirror/bypass/bypass-13.txt",
-    "https://raw.githubusercontent.com/whoahaow/rjsxrd/main/githubmirror/bypass/bypass-14.txt",
-    "https://raw.githubusercontent.com/whoahaow/rjsxrd/main/githubmirror/bypass/bypass-15.txt",
 ]
 
 PROTOCOLS = ["vless://", "vmess://", "trojan://", "ss://", "ssr://",
              "hysteria://", "hysteria2://", "hy2://", "tuic://"]
 
 # ===== ПАРАМЕТРЫ =====
-TARGET_COUNT = 80       # сколько рабочих конфигов нужно
-TIMEOUT = 4             # сек на TCP-проверку одного
-MAX_WORKERS = 50        # параллельных проверок
-MAX_ROUNDS = 5          # сколько раз гонять источники
+TARGET_COUNT = 80
+TIMEOUT = 4
+MAX_WORKERS = 50
+MAX_ROUNDS = 5
+
+# ===== КЭШ ГЕО =====
+GEO_CACHE = {}
+GEO_API = "http://ip-api.com/json/{ip}?fields=status,country,countryCode"
 
 
-# ===== 1. ЗАГРУЗКА ВСЕХ КОНФИГОВ =====
+# ===== 1. ЗАГРУЗКА =====
 def fetch_all():
     configs = []
     for url in SOURCES:
@@ -83,12 +81,12 @@ def check_one(cfg):
         start = time.time()
         with socket.create_connection((host, port), timeout=TIMEOUT):
             ping = int((time.time() - start) * 1000)
-        return (cfg, ping)
+        return (cfg, host, ping)
     except Exception:
         return None
 
 
-# ===== 4. ПРОВЕРКА БАТЧА ПАРАЛЛЕЛЬНО =====
+# ===== 4. БАТЧ-ПРОВЕРКА =====
 def verify_batch(batch):
     alive = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
@@ -100,15 +98,81 @@ def verify_batch(batch):
     return alive
 
 
-# ===== 5. ДОБИРАЕМ РАБОЧИЕ, ПОКА НЕ НАБЕРЁМ ЦЕЛЬ =====
+# ===== 5. ГЕО-ОПРЕДЕЛЕНИЕ =====
+def get_country(host):
+    if not host:
+        return None, None
+    # Если это домен — резолвим в IP
+    ip = host
+    try:
+        socket.inet_aton(host)
+    except OSError:
+        try:
+            ip = socket.gethostbyname(host)
+        except Exception:
+            return None, None
+
+    if ip in GEO_CACHE:
+        return GEO_CACHE[ip]
+
+    try:
+        r = requests.get(GEO_API.format(ip=ip), timeout=5)
+        data = r.json()
+        if data.get("status") == "success":
+            result = (data.get("countryCode", ""), data.get("country", ""))
+        else:
+            result = (None, None)
+    except Exception:
+        result = (None, None)
+
+    GEO_CACHE[ip] = result
+    time.sleep(0.05)   # мягкий rate-limit (ip-api: 45/мин)
+    return result
+
+
+# ===== 6. ФЛАГ ИЗ КОДА СТРАНЫ =====
+def flag_emoji(country_code):
+    if not country_code or len(country_code) != 2:
+        return "🏴"
+    code = country_code.upper()
+    return chr(0x1F1E6 + ord(code[0]) - ord("A")) + chr(0x1F1E6 + ord(code[1]) - ord("A"))
+
+
+# ===== 7. ПЕРЕИМЕНОВАТЬ КОНФИГ =====
+def rename_config(cfg, country_code, country_name):
+    if not country_name:
+        label = "🌐 Unknown (LTE)"
+    else:
+        label = f"{flag_emoji(country_code)} {country_name} (LTE)"
+
+    # Убираем старый фрагмент (#...) если он есть
+    base = cfg.split("#", 1)[0]
+
+    # Для vmess — переименование делается через поле "ps" в JSON
+    if base.startswith("vmess://"):
+        try:
+            payload = base[8:]
+            decoded = base64.b64decode(payload + "=" * (-len(payload) % 4)).decode("utf-8", "ignore")
+            d = json.loads(decoded)
+            d["ps"] = label
+            new_payload = base64.b64encode(json.dumps(d, ensure_ascii=False).encode("utf-8")).decode("ascii")
+            return "vmess://" + new_payload
+        except Exception:
+            return base + "#" + quote(label)
+
+    # Для всех остальных — просто добавляем #label
+    return base + "#" + quote(label)
+
+
+# ===== 8. ДОБОР РАБОЧИХ =====
 def collect_working(configs):
-    alive = {}
+    alive = {}   # cfg -> (host, ping)
     queue = configs.copy()
 
     for rnd in range(1, MAX_ROUNDS + 1):
         print(f"\nРаунд {rnd} | очередь: {len(queue)} | уже рабочих: {len(alive)}")
         if not queue:
-            print("Очередь пуста — повторяю источники заново")
+            print("Очередь пуста — заново")
             queue = [c for c in configs if c not in alive]
             if not queue:
                 break
@@ -121,22 +185,28 @@ def collect_working(configs):
 
         print(f"Проверяю {len(batch)} конфигов...")
         results = verify_batch(batch)
-        for cfg, ping in results:
+        for cfg, host, ping in results:
             if cfg not in alive:
-                alive[cfg] = ping
+                alive[cfg] = (host, ping)
         print(f"Живых в раунде: {len(results)} | всего рабочих: {len(alive)}")
 
         if len(alive) >= TARGET_COUNT:
-            print(f"Цель достигнута: {len(alive)}")
             break
 
-    sorted_alive = sorted(alive.items(), key=lambda x: x[1])
-    return sorted_alive[:TARGET_COUNT]
+    return sorted(alive.items(), key=lambda x: x[1][1])[:TARGET_COUNT]
 
 
-# ===== 6. СОХРАНЕНИЕ =====
+# ===== 9. СОХРАНЕНИЕ =====
 def save(top):
-    lines = [c for c, _ in top]
+    print(f"\nОпределяю страны для {len(top)} конфигов...")
+    lines = []
+    for i, (cfg, (host, ping)) in enumerate(top, 1):
+        cc, cn = get_country(host)
+        renamed = rename_config(cfg, cc, cn)
+        lines.append(renamed)
+        if i % 10 == 0:
+            print(f"  обработано {i}/{len(top)}")
+
     with open("sub.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     print(f"Сохранено {len(lines)} конфигов в sub.txt")
